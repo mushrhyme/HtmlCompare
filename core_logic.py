@@ -11,6 +11,7 @@ import re
 
 
 ABSOLUTE_THRESHOLD = 0.2
+CONTEXT_MATCH_THRESHOLD = 0.3  # 🆕 컨텍스트 매칭 최소 threshold (컨텍스트가 있는 경우 필수)
 
 class HTMLComparator:
     """HTML 문서 비교를 위한 통합 클래스"""
@@ -199,17 +200,129 @@ class HTMLComparator:
         """
         return comparison_html
     
+    def create_individual_html_with_highlighting(self, before_html, after_html, changes, search_tolerance=50, context_window=50, context_words=3):
+        """하이라이팅된 원본 HTML과 수정된 HTML을 각각 반환"""
+        soup_before = BeautifulSoup(before_html, 'html.parser')
+        soup_after = BeautifulSoup(after_html, 'html.parser')
+        
+        self._apply_highlights_to_html(soup_before, soup_after, changes, search_tolerance, context_window, context_words)
+        
+        style = """
+        <style>
+        body {
+            margin: 20px;
+            font-family: Arial, sans-serif;
+        }
+        .html-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            padding: 8px;
+            background-color: #f8f9fa;
+            border-radius: 3px;
+            color: #333;
+        }
+        .highlight-added {
+            background-color: #d4edda !important;
+            border: 3px solid #28a745 !important;
+            padding: 4px !important;
+            border-radius: 5px !important;
+            position: relative !important;
+            display: inline-block !important;
+            margin: 2px !important;
+            font-weight: bold !important;
+        }
+        .highlight-removed {
+            background-color: #f8d7da !important;
+            border: 3px solid #dc3545 !important;
+            padding: 4px !important;
+            border-radius: 5px !important;
+            position: relative !important;
+            display: inline-block !important;
+            margin: 2px !important;
+            font-weight: bold !important;
+        }
+        .highlight-modified {
+            background-color: #fff3cd !important;
+            border: 3px solid #ffc107 !important;
+            padding: 4px !important;
+            border-radius: 5px !important;
+            position: relative !important;
+            display: inline-block !important;
+            margin: 2px !important;
+            font-weight: bold !important;
+        }
+        .highlight-tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: nowrap;
+            z-index: 9999;
+            top: -35px;
+            left: 0;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+        .highlight-added:hover .highlight-tooltip,
+        .highlight-removed:hover .highlight-tooltip,
+        .highlight-modified:hover .highlight-tooltip {
+            opacity: 1;
+        }
+        </style>
+        """
+        
+        before_html_individual = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            {style}
+        </head>
+        <body>
+            <div class="html-title">📄 원본 HTML</div>
+            <div>{str(soup_before)}</div>
+        </body>
+        </html>
+        """
+        
+        after_html_individual = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            {style}
+        </head>
+        <body>
+            <div class="html-title">📝 수정된 HTML</div>
+            <div>{str(soup_after)}</div>
+        </body>
+        </html>
+        """
+        
+        return before_html_individual, after_html_individual
+    
     def _apply_highlights_to_html(self, soup_before, soup_after, changes, search_tolerance=50, context_window=50, context_words=3):
         """HTML 요소에 변경사항 하이라이팅 적용 (컨텍스트 기반 매칭 지원)"""
         original_soup_before = soup_before
         modified_soup_after = soup_after
         
+        # 🆕 이미 하이라이팅된 요소 추적 (중복 방지)
+        highlighted_elements_before = set()  # 원본 HTML에서 이미 하이라이팅된 요소
+        highlighted_elements_after = set()   # 수정본 HTML에서 이미 하이라이팅된 요소
+        
         for i, change in enumerate(changes):
             if change["type"] == "text":
-                result = self._highlight_text_in_html(original_soup_before, modified_soup_after, change, i, search_tolerance, context_window, context_words)
+                result = self._highlight_text_in_html(
+                    original_soup_before, modified_soup_after, change, i, 
+                    search_tolerance, context_window, context_words,
+                    highlighted_elements_before, highlighted_elements_after  # 🆕 전달
+                )
                 change["highlighting_result"] = result
         
-    def _highlight_text_in_html(self, original_soup_before, modified_soup_after, change, change_index, search_tolerance=50, context_window=50, context_words=3):
+    def _highlight_text_in_html(self, original_soup_before, modified_soup_after, change, change_index, search_tolerance=50, context_window=50, context_words=3, highlighted_elements_before=None, highlighted_elements_after=None):
         """텍스트 변경사항을 HTML에서 하이라이팅 (컨텍스트 고려 매칭)"""
         status = change["status"]
         before_text = " ".join(change.get("before", []))
@@ -217,6 +330,12 @@ class HTMLComparator:
         
         # 변경사항의 앞뒤 컨텍스트 추출
         context_before, context_after = self._extract_change_context(change)
+        
+        # 🆕 하이라이팅된 요소 추적 set 초기화 (없으면 생성)
+        if highlighted_elements_before is None:
+            highlighted_elements_before = set()
+        if highlighted_elements_after is None:
+            highlighted_elements_after = set()
         
         result = {
             "before_highlighted": False,
@@ -244,7 +363,8 @@ class HTMLComparator:
             success, matched_html, debug_info = self._find_and_highlight_text_by_content(
                 original_soup_before, before_text, "highlight-removed", 
                 f"변경사항 {change_index+1}: 삭제됨: {before_text}", apply_highlighting=True,
-                context_before=context_before, context_after=context_after
+                context_before=context_before, context_after=context_after,
+                highlighted_elements=highlighted_elements_before  # 🆕 전달
             )
             result["before_highlighted"] = success
             result["before_matched_html"] = matched_html
@@ -256,7 +376,8 @@ class HTMLComparator:
             success, matched_html, debug_info = self._find_and_highlight_text_by_content(
                 modified_soup_after, after_text, "highlight-added", 
                 f"변경사항 {change_index+1}: 추가됨: {after_text}", apply_highlighting=True,
-                context_before=context_before, context_after=context_after
+                context_before=context_before, context_after=context_after,
+                highlighted_elements=highlighted_elements_after  # 🆕 전달
             )
             result["after_highlighted"] = success
             result["after_matched_html"] = matched_html
@@ -268,13 +389,15 @@ class HTMLComparator:
             success_before, matched_html_before, debug_info_before = self._find_and_highlight_text_by_content(
                 original_soup_before, before_text, "highlight-modified", 
                 f"변경사항 {change_index+1}: 변경됨: {before_text} → {after_text}", apply_highlighting=True,
-                context_before=context_before, context_after=context_after
+                context_before=context_before, context_after=context_after,
+                highlighted_elements=highlighted_elements_before  # 🆕 전달
             )
             # 수정된 HTML에서 수정된 텍스트 찾기 (컨텍스트 고려 매칭)
             success_after, matched_html_after, debug_info_after = self._find_and_highlight_text_by_content(
                 modified_soup_after, after_text, "highlight-modified", 
                 f"변경사항 {change_index+1}: 변경됨: {before_text} → {after_text}", apply_highlighting=True,
-                context_before=context_before, context_after=context_after
+                context_before=context_before, context_after=context_after,
+                highlighted_elements=highlighted_elements_after  # 🆕 전달
             )
             result["before_highlighted"] = success_before
             result["after_highlighted"] = success_after
@@ -320,22 +443,36 @@ class HTMLComparator:
             return None, None
 
 
-    def _find_and_highlight_text_by_content(self, soup, target_text, css_class, tooltip, apply_highlighting=True, context_before=None, context_after=None):
+    def _find_and_highlight_text_by_content(self, soup, target_text, css_class, tooltip, apply_highlighting=True, context_before=None, context_after=None, highlighted_elements=None):
         """텍스트 내용과 앞뒤 컨텍스트를 고려해서 HTML에서 텍스트를 찾아 하이라이팅"""
         if not target_text.strip():
             return False, None, {"error": "빈 타겟 텍스트"}
             
         target_text = target_text.strip()
-        highlighted_elements = set()
+        
+        # 🆕 이미 하이라이팅된 요소 추적 (없으면 새로 생성)
+        if highlighted_elements is None:
+            highlighted_elements = set()
         
         # 모든 텍스트 노드에서 타겟 텍스트 검색
         matches_found = 0
         matched_html = None
         all_matches = []
+        context_validation = None  # 🆕 validation 정보 저장용 변수 (함수 시작 부분에서 초기화)
         
         # HTML의 모든 텍스트 노드 검색
         for element in soup.find_all(text=True):
+            # 🆕 이미 하이라이팅된 요소는 건너뛰기
+            if element in highlighted_elements:
+                continue
+                
             if element.parent and element.parent.name not in ['script', 'style']:
+                # 🆕 이미 하이라이팅된 span 내부의 텍스트는 건너뛰기
+                if element.parent and element.parent.name == 'span' and element.parent.get('class'):
+                    parent_classes = element.parent.get('class', [])
+                    if any(cls in ['highlight-added', 'highlight-removed', 'highlight-modified'] for cls in parent_classes):
+                        continue
+                
                 text_content = re.sub(r'\s+', ' ', element.replace('\u00a0', ' ').strip())
                 
                 if text_content and target_text in text_content:
@@ -351,15 +488,28 @@ class HTMLComparator:
                     # 컨텍스트 매칭 점수 계산 (상세 정보 포함)
                     context_score = 0.0
                     context_details = None
-                    if context_before or context_after:
+                    has_context_requirement = bool(context_before or context_after)  # 🆕 컨텍스트 요구사항 여부
+                    
+                    if has_context_requirement:
                         context_score, context_details = self._calculate_context_match_score_with_details(
                             element, target_text, context_before, context_after
                         )
                         print(f"   🎯 컨텍스트 점수: {context_score:.3f}")
+                        
+                        # 🆕 컨텍스트가 있는데 매칭이 너무 낮으면 제외
+                        if context_score < CONTEXT_MATCH_THRESHOLD:
+                            print(f"   ❌ 컨텍스트 매칭 실패 (threshold 미달: {context_score:.3f} < {CONTEXT_MATCH_THRESHOLD})")
+                            continue  # 이 매칭은 건너뛰기
                     
-                    # 최종 점수 = 기본 유사도 + 컨텍스트 보너스
-                    final_score = basic_similarity + (context_score * 0.5)  # 컨텍스트 보너스 50%
-                    print(f"   🏆 최종 점수: {final_score:.3f}")
+                    # 🆕 최종 점수 계산: 컨텍스트가 있으면 컨텍스트 우선, 없으면 기본 유사도만
+                    if has_context_requirement:
+                        # 컨텍스트가 있는 경우: 컨텍스트 점수를 더 중요하게 반영
+                        final_score = basic_similarity * 0.3 + context_score * 0.7  # 컨텍스트 70% 가중치
+                    else:
+                        # 컨텍스트가 없는 경우: 기본 유사도만 사용
+                        final_score = basic_similarity
+                    
+                    print(f"   🏆 최종 점수: {final_score:.3f} (컨텍스트 요구: {has_context_requirement})")
                     
                     all_matches.append({
                         "element": element,
@@ -368,13 +518,54 @@ class HTMLComparator:
                         "context_score": context_score,
                         "context_details": context_details,
                         "final_score": final_score,
-                        "parent_tag": element.parent.name if element.parent else "None"
+                        "parent_tag": element.parent.name if element.parent else "None",
+                        "has_context_requirement": has_context_requirement  # 🆕 컨텍스트 요구사항 여부
                     })
         
         if all_matches:
-            # 최종 점수 순으로 정렬하여 가장 좋은 매치 선택
-            all_matches.sort(key=lambda x: x["final_score"], reverse=True)
+            # 🆕 컨텍스트 요구사항이 있는 매칭을 우선 정렬
+            # 1순위: 컨텍스트 요구사항이 있고 점수가 높은 것
+            # 2순위: 컨텍스트 요구사항이 없는 것
+            all_matches.sort(key=lambda x: (
+                x.get("has_context_requirement", False),  # 컨텍스트 요구사항이 있으면 True (우선)
+                x["final_score"]  # 그 다음 점수
+            ), reverse=True)
             best_match = all_matches[0]
+            
+            # 🆕 컨텍스트 요구사항이 있는 경우 추가 검증
+            if best_match.get("has_context_requirement", False):
+                if best_match["context_score"] < CONTEXT_MATCH_THRESHOLD:
+                    print(f"❌ 최종 선택된 매칭도 컨텍스트 threshold 미달: {best_match['context_score']:.3f} < {CONTEXT_MATCH_THRESHOLD}")
+                    return False, None, {"error": "컨텍스트 매칭 실패", "context_score": best_match["context_score"]}
+                
+                # 🆕 하이라이팅 전 최종 컨텍스트 검증: 앞뒤 컨텍스트가 모두 일치해야 함
+                context_validation = self._validate_context_before_highlighting(
+                    best_match["element"], target_text, context_before, context_after
+                )
+                
+                if not context_validation["valid"]:
+                    print(f"❌ 하이라이팅 전 컨텍스트 검증 실패:")
+                    print(f"   앞 컨텍스트 일치: {context_validation.get('before_match', False)} (점수: {context_validation.get('before_score', 0):.3f})")
+                    print(f"   뒤 컨텍스트 일치: {context_validation.get('after_match', False)} (점수: {context_validation.get('after_score', 0):.3f})")
+                    print(f"   찾는 앞 컨텍스트: '{context_before[:100] if context_before else 'None'}...'")
+                    print(f"   실제 앞 컨텍스트: '{context_validation.get('actual_before_context', '')[-100:] if context_validation.get('actual_before_context') else 'None'}...'")
+                    print(f"   찾는 뒤 컨텍스트: '{context_after[:100] if context_after else 'None'}...'")
+                    print(f"   실제 뒤 컨텍스트: '{context_validation.get('actual_after_context', '')[:100] if context_validation.get('actual_after_context') else 'None'}...'")
+                    
+                    # 🆕 오류 발생 시에도 debug_info 생성하여 validation 정보 포함
+                    error_debug_info = {
+                        "error": "컨텍스트 검증 실패",
+                        "validation": context_validation,
+                        "target_text": target_text,
+                        "context_before": context_before,
+                        "context_after": context_after,
+                        "matched_text_content": best_match.get("text"),
+                        "basic_similarity": best_match.get("similarity", 0),
+                        "context_score": best_match.get("context_score", 0),
+                        "final_score": best_match.get("final_score", 0)
+                    }
+                    return False, None, error_debug_info
+                print(f"✅ 하이라이팅 전 컨텍스트 검증 통과")
             
             # 유사도 threshold 확인
             if best_match["final_score"] >= ABSOLUTE_THRESHOLD:
@@ -395,7 +586,17 @@ class HTMLComparator:
             partial_matches = []
             
             for element in soup.find_all(text=True):
+                # 🆕 이미 하이라이팅된 요소는 건너뛰기
+                if element in highlighted_elements:
+                    continue
+                    
                 if element and element.parent and element.parent.name not in ['script', 'style']:
+                    # 🆕 이미 하이라이팅된 span 내부의 텍스트는 건너뛰기
+                    if element.parent and element.parent.name == 'span' and element.parent.get('class'):
+                        parent_classes = element.parent.get('class', [])
+                        if any(cls in ['highlight-added', 'highlight-removed', 'highlight-modified'] for cls in parent_classes):
+                            continue
+                    
                     text_content = re.sub(r'\s+', ' ', element.replace('\u00a0', ' ').strip())
                     if text_content and (text_content in target_text or target_text in text_content):
                         # 부분 매칭에서도 유사도 계산
@@ -784,6 +985,10 @@ class HTMLComparator:
             ]
         }
         
+        # 🆕 validation 정보를 debug_info에 추가 (시각화용)
+        if context_validation is not None:
+            debug_info["validation"] = context_validation
+        
         return matches_found > 0, matched_html, debug_info
 
     def _calculate_context_match_score_with_details(self, element, target_text, context_before, context_after):
@@ -793,13 +998,18 @@ class HTMLComparator:
             row_text = ""
             td_elements = []
             context_available = False
+            target_position_in_row = -1  # 타겟 텍스트가 row_text 내에서의 위치
             
             # 1. 테이블 행(<tr>)이 있는 경우
             if element.parent and element.parent.parent and element.parent.parent.name == 'tr':
                 parent_tr = element.parent.parent
                 # 같은 행의 모든 텍스트 수집
-                for td in parent_tr.find_all('td'):
+                current_td_index = -1
+                for idx, td in enumerate(parent_tr.find_all('td')):
                     td_text = re.sub(r'\s+', ' ', td.get_text().replace('\u00a0', ' ').strip())
+                    if element.parent == td:
+                        current_td_index = idx
+                        target_position_in_row = len(row_text)  # 타겟 텍스트 시작 위치
                     row_text += td_text + " "
                     td_elements.append({
                         'element': td,
@@ -812,6 +1022,7 @@ class HTMLComparator:
                 # 현재 요소의 텍스트만 사용
                 current_text = re.sub(r'\s+', ' ', element.string or element.get_text() or '').strip()
                 row_text = current_text
+                target_position_in_row = 0  # 타겟 텍스트는 전체 텍스트 내에 포함
                 td_elements.append({
                     'element': element.parent,
                     'text': current_text,
@@ -826,6 +1037,23 @@ class HTMLComparator:
             if context_available:
                 row_text = row_text.strip()
                 
+                # 🆕 타겟 텍스트 주변의 실제 컨텍스트 추출 (더 정확한 매칭)
+                actual_before_context = None
+                actual_after_context = None
+                
+                if target_position_in_row >= 0:
+                    # 타겟 텍스트 앞부분 추출 (최대 100자)
+                    before_start = max(0, target_position_in_row - 100)
+                    actual_before_context = row_text[before_start:target_position_in_row].strip()
+                    
+                    # 타겟 텍스트 뒷부분 추출 (최대 100자)
+                    after_end = min(len(row_text), target_position_in_row + len(target_text) + 100)
+                    actual_after_context = row_text[target_position_in_row + len(target_text):after_end].strip()
+                else:
+                    # 타겟 텍스트 위치를 찾을 수 없는 경우 전체 텍스트 사용
+                    actual_before_context = row_text
+                    actual_after_context = row_text
+                
                 # 컨텍스트 매칭 점수 계산
                 score = 0.0
                 details = {
@@ -834,34 +1062,40 @@ class HTMLComparator:
                     'target_text': target_text,
                     'context_before': context_before,
                     'context_after': context_after,
+                    'actual_before_context': actual_before_context,  # 🆕 실제 앞 컨텍스트
+                    'actual_after_context': actual_after_context,    # 🆕 실제 뒤 컨텍스트
                     'before_score': 0.0,
                     'after_score': 0.0,
                     'pattern_score': 0.0,
-                    'before_weight': 0.3,
-                    'after_weight': 0.3,
-                    'pattern_weight': 0.4
+                    'before_weight': 0.4,  # 🆕 가중치 조정
+                    'after_weight': 0.4,
+                    'pattern_weight': 0.2
                 }
                 
-                # 앞 컨텍스트 매칭
-                if context_before:
-                    before_score = self._calculate_text_similarity(row_text, context_before)
-                    score += before_score * 0.3  # 앞 컨텍스트 30% 가중치
+                # 앞 컨텍스트 매칭 (실제 앞 컨텍스트와 비교)
+                if context_before and actual_before_context:
+                    # 실제 앞 컨텍스트의 끝부분과 찾는 앞 컨텍스트 비교
+                    before_score = self._calculate_text_similarity(actual_before_context[-len(context_before)*2:], context_before)
+                    score += before_score * 0.4  # 앞 컨텍스트 40% 가중치
                     details['before_score'] = before_score
-                    print(f"   🎯 앞 컨텍스트 매칭: {before_score:.3f} (찾는 것: '{context_before[:30]}...', 실제: '{row_text[:50]}...')")
+                    print(f"   🎯 앞 컨텍스트 매칭: {before_score:.3f} (찾는 것: '{context_before[:30]}...', 실제: '{actual_before_context[-50:]}...')")
                 
-                # 뒤 컨텍스트 매칭
-                if context_after:
-                    after_score = self._calculate_text_similarity(row_text, context_after)
-                    score += after_score * 0.3  # 뒤 컨텍스트 30% 가중치
+                # 뒤 컨텍스트 매칭 (실제 뒤 컨텍스트와 비교)
+                if context_after and actual_after_context:
+                    # 실제 뒤 컨텍스트의 앞부분과 찾는 뒤 컨텍스트 비교
+                    after_score = self._calculate_text_similarity(actual_after_context[:len(context_after)*2], context_after)
+                    score += after_score * 0.4  # 뒤 컨텍스트 40% 가중치
                     details['after_score'] = after_score
-                    print(f"   🎯 뒤 컨텍스트 매칭: {after_score:.3f} (찾는 것: '{context_after[:30]}...', 실제: '{row_text[-50:]}...')")
+                    print(f"   🎯 뒤 컨텍스트 매칭: {after_score:.3f} (찾는 것: '{context_after[:30]}...', 실제: '{actual_after_context[:50]}...')")
                 
                 # 타겟 텍스트 주변 패턴 매칭
                 if context_before and context_after:
                     # "앞컨텍스트 타겟텍스트 뒤컨텍스트" 패턴 검색
                     pattern = f"{context_before} {target_text} {context_after}"
-                    pattern_score = self._calculate_text_similarity(row_text, pattern)
-                    score += pattern_score * 0.4  # 패턴 매칭 40% 가중치
+                    # 타겟 텍스트 주변 텍스트 추출
+                    pattern_text = f"{actual_before_context[-50:]} {target_text} {actual_after_context[:50]}"
+                    pattern_score = self._calculate_text_similarity(pattern_text, pattern)
+                    score += pattern_score * 0.2  # 패턴 매칭 20% 가중치
                     details['pattern_score'] = pattern_score
                     details['pattern'] = pattern
                     print(f"   🎯 패턴 매칭: {pattern_score:.3f}")
@@ -877,6 +1111,106 @@ class HTMLComparator:
         
         print(f"   ❌ 컨텍스트를 찾을 수 없음 (element.parent: {element.parent is not None if element else False})")
         return 0.0, {'error': 'No parent tr found or element is None'}
+    
+    def _validate_context_before_highlighting(self, element, target_text, context_before, context_after):
+        """하이라이팅 전 최종 컨텍스트 검증: 앞뒤 컨텍스트가 모두 일치해야 함"""
+        try:
+            # 실제 컨텍스트 추출
+            row_text = ""
+            target_position_in_row = -1
+            
+            # 1. 테이블 행(<tr>)이 있는 경우
+            if element.parent and element.parent.parent and element.parent.parent.name == 'tr':
+                parent_tr = element.parent.parent
+                for idx, td in enumerate(parent_tr.find_all('td')):
+                    td_text = re.sub(r'\s+', ' ', td.get_text().replace('\u00a0', ' ').strip())
+                    if element.parent == td:
+                        target_position_in_row = len(row_text)
+                    row_text += td_text + " "
+            # 2. 일반 요소인 경우
+            elif element.parent:
+                current_text = re.sub(r'\s+', ' ', element.string or element.get_text() or '').strip()
+                row_text = current_text
+                target_position_in_row = 0
+            else:
+                return {
+                    "valid": False,
+                    "error": "컨텍스트 추출 불가"
+                }
+            
+            row_text = row_text.strip()
+            
+            # 타겟 텍스트 주변의 실제 컨텍스트 추출
+            if target_position_in_row >= 0:
+                # 앞 컨텍스트 추출 (최대 200자)
+                before_start = max(0, target_position_in_row - 200)
+                actual_before_context = row_text[before_start:target_position_in_row].strip()
+                
+                # 뒤 컨텍스트 추출 (최대 200자)
+                after_end = min(len(row_text), target_position_in_row + len(target_text) + 200)
+                actual_after_context = row_text[target_position_in_row + len(target_text):after_end].strip()
+            else:
+                return {
+                    "valid": False,
+                    "error": "타겟 텍스트 위치를 찾을 수 없음"
+                }
+            
+            # 앞뒤 컨텍스트 검증
+            before_match = False
+            after_match = False
+            before_score = 0.0
+            after_score = 0.0
+            
+            # 앞 컨텍스트 검증: 실제 앞 컨텍스트의 끝부분에 찾는 앞 컨텍스트가 포함되어야 함
+            if context_before:
+                # 실제 앞 컨텍스트의 끝부분 (찾는 컨텍스트 길이의 2배만큼)
+                before_check_text = actual_before_context[-len(context_before)*3:] if len(actual_before_context) > len(context_before)*3 else actual_before_context
+                before_score = self._calculate_text_similarity(before_check_text, context_before)
+                # 🆕 엄격한 검증: 유사도가 0.5 이상이어야 함 (50% 이상 일치)
+                before_match = before_score >= 0.5
+                print(f"   🔍 앞 컨텍스트 검증: {before_score:.3f} (필요: 0.5 이상) - {'✅ 통과' if before_match else '❌ 실패'}")
+                print(f"      찾는 것: '{context_before[:50]}...'")
+                print(f"      실제 것: '{before_check_text[-50:] if len(before_check_text) > 50 else before_check_text}...'")
+            
+            # 뒤 컨텍스트 검증: 실제 뒤 컨텍스트의 앞부분에 찾는 뒤 컨텍스트가 포함되어야 함
+            if context_after:
+                # 실제 뒤 컨텍스트의 앞부분 (찾는 컨텍스트 길이의 2배만큼)
+                after_check_text = actual_after_context[:len(context_after)*3] if len(actual_after_context) > len(context_after)*3 else actual_after_context
+                after_score = self._calculate_text_similarity(after_check_text, context_after)
+                # 🆕 엄격한 검증: 유사도가 0.5 이상이어야 함 (50% 이상 일치)
+                after_match = after_score >= 0.5
+                print(f"   🔍 뒤 컨텍스트 검증: {after_score:.3f} (필요: 0.5 이상) - {'✅ 통과' if after_match else '❌ 실패'}")
+                print(f"      찾는 것: '{context_after[:50]}...'")
+                print(f"      실제 것: '{after_check_text[:50] if len(after_check_text) > 50 else after_check_text}...'")
+            
+            # 둘 다 제공된 경우 둘 다 일치해야 함
+            if context_before and context_after:
+                valid = before_match and after_match
+            # 하나만 제공된 경우 그것만 일치하면 됨
+            elif context_before:
+                valid = before_match
+            elif context_after:
+                valid = after_match
+            else:
+                # 컨텍스트가 없으면 검증 통과 (기본 유사도만으로 판단)
+                valid = True
+            
+            return {
+                "valid": valid,
+                "before_match": before_match if context_before else None,
+                "after_match": after_match if context_after else None,
+                "before_score": before_score if context_before else None,
+                "after_score": after_score if context_after else None,
+                "actual_before_context": actual_before_context,
+                "actual_after_context": actual_after_context
+            }
+            
+        except Exception as e:
+            print(f"   ❌ 컨텍스트 검증 오류: {e}")
+            return {
+                "valid": False,
+                "error": str(e)
+            }
 
     def _get_html_context_with_siblings(self, element, context_range=5):
          """매칭된 요소의 앞뒤 형제 요소들을 포함한 HTML 컨텍스트 반환"""
